@@ -11,6 +11,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import json
 import numpy as np
 import pytorch_lightning as pl
 import torch
@@ -402,8 +403,17 @@ class SummarizationModule(BaseTransformer):
         parser.add_argument("--unlikelihood_exclude_tokens", default="", type=str, required=False, help="Comma-separated numbers")
         parser.add_argument("--unlikelihood_num_weights", default=100, type=int, required=False, help="The number of weights in unlikelihood training, if -1 use all of them")
         parser.add_argument("--unlikelihood_softmax", action="store_true", help="whether to softmax the token weights in unlikelihood training")
+        parser.add_argument("--unlikelihood_temperature", default=1, type=int, help="temperature to use in softmax when normalizing logistic regression weights")
         parser.add_argument("--unlikelihood_selective_penalty", action="store_true", help="whether to use unlikelihood loss only if argmax is the penalty token")
         parser.add_argument("--unlikelihood_alpha", default=10.0, type=float, required=False, help="")
+
+        ################################
+        ###   Ratio Loss Parameters  ###
+        ################################
+
+        parser.add_argument("--ratio_training", action="store_true", help="whether to emply ratio training")
+        parser.add_argument("--ratio_alpha", default=10.0, type=float, required=False, help="scale factor in loss")
+        parser.add_argument("--ratio_mask_fraction", default=0.15, type=float, required=False, help="ratio of tokens that are masked when computing BERT probabilities")
 
         return parser
 
@@ -434,6 +444,7 @@ def set_ul_params(model, hparams):
     model.unlikelihood_weights_file = hparams.unlikelihood_weights_file
     model.unlikelihood_num_weights = hparams.unlikelihood_num_weights
     model.unlikelihood_softmax = hparams.unlikelihood_softmax
+    model.unlikelihood_temperature = hparams.unlikelihood_temperature
     model.unlikelihood_selective_penalty = hparams.unlikelihood_selective_penalty
     model.unlikelihood_alpha = hparams.unlikelihood_alpha
     model.unlikelihood_exclude_tokens = set([int(i) for i in hparams.unlikelihood_exclude_tokens.split(',')])
@@ -458,7 +469,7 @@ def set_ul_params(model, hparams):
     weights = torch.tensor([abs(x[1]) for x in weights])
 
     if model.unlikelihood_softmax:
-        weights = F.softmax(weights, dim=-1)
+        weights = F.softmax(weights/model.unlikelihood_temperature, dim=-1)
     else:
         #normalize alpha if not applying softmax
         model.unlikelihood_alpha /= torch.sum(weights).item()
@@ -471,6 +482,18 @@ def set_ul_params(model, hparams):
         weight_vector[ids[i]] = weights[i]
 
     model.weight_vector = weight_vector.to('cuda')
+
+
+def set_ratio_params(model, hparams):
+
+    model.ratio_training = hparams.ratio_training
+
+    if not model.ratio_training:
+        return
+
+    model.ratio_alpha = hparams.ratio_alpha
+    model.ratio_mask_fraction = hparams.ratio_mask_fraction
+    model.bert_model = 
 
 
 def main(args, model=None) -> SummarizationModule:
@@ -547,6 +570,7 @@ def main(args, model=None) -> SummarizationModule:
             model = BartForConditionalGeneration.from_pretrained(join(args.output_dir, f'best_tfmr-{args.generate_epoch}'))
         else:
             print("********* using fresh model *********")
+            args.generate_epoch = 'no-train'
             model = BartForConditionalGeneration.from_pretrained(args.model_name_or_path)
  
         tokenizer = BartTokenizer.from_pretrained(args.model_name_or_path)
@@ -579,9 +603,16 @@ def main(args, model=None) -> SummarizationModule:
         for i,d,a,p in zip(range(len(dois)), dois, abstracts, pls):
             try:
                 ids = input_ids[i]
+                #gen_ids = model.generate(ids.unsqueeze(0), 
+                #                         num_beams=4, 
+                #                         max_length=args.max_target_length, 
+                #                         early_stopping=False, 
+                #                         num_return_sequences=1, 
+                #                         decoder_start_token_id=model.config.pad_token_id)
+
                 gen_ids = model.generate(ids.unsqueeze(0), 
-                                         num_beams=4, 
                                          max_length=args.max_target_length, 
+                                         top_p=0.9, 
                                          early_stopping=False, 
                                          num_return_sequences=1, 
                                          decoder_start_token_id=model.config.pad_token_id)
@@ -593,7 +624,8 @@ def main(args, model=None) -> SummarizationModule:
                 pls_final.append(pls[i])
                 gen_final.append(gen_text)
 
-                fname_text = f'gen_{args.generate_input_prefix}_{args.generate_epoch}_{args.generate_start_index}-{args.generate_end_index}_text_only.txt'
+                fname_text = f'gen_nucleus_{args.generate_input_prefix}_{args.generate_epoch}_{args.generate_start_index}-{args.generate_end_index}_text_only.txt'
+
                 with open(join(args.output_dir, fname_text), 'a+') as f:
                     f.write(gen_text + '\n----------------------------------------\n')
                     f.flush()
@@ -604,8 +636,8 @@ def main(args, model=None) -> SummarizationModule:
                 print(d)
 
         output = [{'doi': d, 'abstract': a, 'pls': p, 'gen': g} for d,a,p,g in zip(dois_final, abstracts_final, pls_final, gen_final)]
-        
-        fname_json = f'gen_{args.generate_input_prefix}_{args.generate_epoch}_{args.generate_start_index}-{args.generate_end_index}.json'
+ 
+        fname_json = f'gen_nucleus_{args.generate_input_prefix}_{args.generate_epoch}_{args.generate_start_index}-{args.generate_end_index}.json'
         open(join(args.output_dir, fname_json), 'w').write(json.dumps(output, indent=2))
 
     return model
