@@ -11,12 +11,14 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import gc
 import json
 import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+import time
 
 
 from callbacks import Seq2SeqLoggingCallback, get_checkpoint_callback, get_early_stopping_callback
@@ -118,6 +120,16 @@ class SummarizationModule(BaseTransformer):
             self.eval_max_length = self.model.config.max_length
         self.val_metric = self.default_val_metric if self.hparams.val_metric is None else self.hparams.val_metric
 
+        #for logging unlikelihood loss
+        self.num_outputs = 0
+        self.num_ul = 0
+
+        #logging loss to plot training curves, a list of dicts
+        #each dict contains the average loss (sum/batch size) for each kind of loss function
+        #used to determine relative contributions of UL and standard cross entropy
+        self.losses = []
+
+
     def save_readable_batch(self, batch: Dict[str, torch.Tensor]) -> Dict[str, List[str]]:
         """A debugging utility"""
         readable_batch = {
@@ -140,7 +152,7 @@ class SummarizationModule(BaseTransformer):
 
         #replace zeros with small positive constant for stability
         neg_probs += (neg_probs==0).float() * 1e-8
-        log_neg_probs = torch.log(neg_probs)
+        log_neg_probs = torch.log(neg_probs) # (N,s,v)
 
         #now create attention mask and apply it
         attention_mask = decoder_input_ids.eq(1).eq(0).float()
@@ -152,18 +164,175 @@ class SummarizationModule(BaseTransformer):
         weight_mask_expanded = weight_mask.unsqueeze(0).unsqueeze(0).expand(N,s,-1)
         weighted_probs = log_neg_probs_masked * weight_mask_expanded
 
-        print("***************")
-        print(f"no penalty: {-torch.sum(weighted_probs)}")
-
         if selective_penalty:
             indices = torch.argmax(logits, dim=-1)
-            indices_mask = F.one_hot(indices, num_classes=logits.shape[-1])
+            indices_mask = F.one_hot(indices, num_classes=logits.shape[-1]) # (N,s,v)
             weighted_probs *= indices_mask
-            print(f"selective penalty: {-torch.sum(weighted_probs)}")
-    
-        print("***************")
 
+            #now determine the number of tokens to which UL is applied
+            count_vec = (weighted_probs != 0).int() # (N,s,v)
+            count_vec = torch.sum(count_vec, dim=-1) # (N,s)
+            pad_mask = decoder_input_ids.eq(1).eq(0).int()
+            count_vec *= pad_mask
+
+            self.num_outputs += pad_mask.sum()
+            self.num_ul += count_vec.sum()
+
+
+        # TODO: take into account batch size (doesn't matter now since N=1)
         return -torch.sum(weighted_probs)
+
+
+    def print_penalty_set(self, count_vector, i, num):
+        for j in range(num):
+            print("********************")
+            for k in range(count_vector.shape[-1]):
+                if count_vector[i,j,k] > 0:
+                    print(f"{k}: {count_vector[i,j,k]}")
+            print("********************")
+
+
+    def unlikelihood_loss_token_old(self, decoder_input_ids, tgt_ids, logits, selective_penalty=True):
+        """
+        decoder_input_ids - (N, s)
+        tgt_ids - (N, s)
+        logits      - (N, s, vocab_size)
+        """
+        probs = F.softmax(logits,dim=-1)
+
+        #replace zeros with small positive constant for stability when applying log
+        neg_probs = torch.clamp(1-probs, min=1e-8)
+        log_neg_probs = torch.log(neg_probs)
+
+        #for each position, produce a count vector for the penalty set
+        N,s,v = logits.shape
+        count_vector = decoder_input_ids.unsqueeze(-1).expand(N,s,v) # (N,s,v)
+        indices = torch.arange(v).expand(N,s,v).cuda()
+        count_vector = torch.cumsum((count_vector==indices).float(), dim=1) # (N,s,v) still
+
+        #now remove special tokens: <s> = 0, </s> = 2, <pad> = 1
+        special_token_mask = torch.ones(v).cuda()
+        special_token_mask[:3] = 0
+        special_token_mask = special_token_mask.expand(N,s,v)
+        count_vector *= special_token_mask
+
+        #now remove the token at that position (don't want to penalize the target token)
+        cur_token_mask = tgt_ids.unsqueeze(-1).expand(N,s,v)
+        cur_token_mask = (cur_token_mask != indices).float()
+        count_vector *= cur_token_mask
+
+        #mask padded input positions
+        mask_pad = decoder_input_ids.eq(1).eq(0).float() # (N,s)
+        mask_pad = mask_pad.unsqueeze(-1).expand(N,s,v)
+        count_vector *= mask_pad
+
+        if selective_penalty:
+            output_indices = torch.argmax(logits, dim=-1)
+            output_indices_mask = F.one_hot(output_indices, num_classes=logits.shape[-1]) # (N,s,v)
+            count_vector *= output_indices_mask
+
+        #now compute the actual loss
+        loss = count_vector * log_neg_probs
+ 
+        # TODO: take into account batch size (doesn't matter now since N=1)
+        return -torch.sum(loss)
+
+
+    def unlikelihood_loss_token(self, decoder_input_ids, tgt_ids, logits):
+        """
+        decoder_input_ids - (N, s)
+        tgt_ids - (N, s)
+        logits      - (N, s, v)
+        """
+        probs = F.softmax(logits,dim=-1)
+        target = tgt_ids.view(-1) # (N,s) -> (N*s,)
+        padding_idx = 1 # <pad>
+
+        #replace zeros with small positive constant for stability when applying log
+        log_neg_probs = torch.log(torch.clamp(1-probs, min=1e-5))
+        log_neg_probs = log_neg_probs.view(-1, log_neg_probs.size(-1)) # (N,s,v) -> (Ns, v)
+
+        with torch.no_grad():
+            ctx_cands = target.unsqueeze(0).expand(target.size(0), target.size(0)) # (Ns, Ns)
+            ctx_cands_ = ctx_cands.tril(-1) + padding_idx
+            ctx_cands_ = ctx_cands_ * ctx_cands_.triu()
+            ctx_cands = ctx_cands.tril(-1) + ctx_cands_
+
+            # Don't include the target for that timestep as a negative target.
+            ctx_cands = ctx_cands.masked_fill(ctx_cands == target.unsqueeze(1), padding_idx)
+            negative_targets = torch.zeros_like(log_neg_probs).scatter_(1, ctx_cands, 1)
+
+        #now compute the actual loss
+        loss = negative_targets * log_neg_probs
+
+        # TODO: take into account batch size (doesn't matter now since N=1)
+        return -loss.sum()
+
+
+    def get_ngrams(self, tokens, n=1):
+        ngrams = set()
+        index = 0
+        while index <= len(tokens)-n:
+            ngrams.add(tuple(tokens[index:index+n]))
+            index += 1
+        return ngrams
+
+    def ngram_repeat_mask(self, src_ids, gen_ids, decoder_input_ids, n):
+        """
+        src_ids - (N, s')
+        gen_ids - (N, s'')
+        decoder_input_ids - (N, s)
+        """
+        mask = torch.zeros_like(decoder_input_ids).float().cuda()
+        for i, (s,g) in enumerate(zip(src_ids,gen_ids)):
+            seen = self.get_ngrams(s.tolist(), n)
+            gl = g.tolist()
+
+            #make sure to leave out start and end token
+            for j in range(1,len(gl)-n):
+                ng = tuple(gl[j:j+n])
+                if ng in seen:
+                    mask[i, j:j+n] = 1
+
+        return mask
+
+    def unlikelihood_loss_copying(self, src_ids, decoder_input_ids, logits, n=3):
+        """
+        src_ids - (N, s')
+        decoder_input_ids - (N, s)
+        logits - (N, s, v)
+        """
+        #now compute actual probability distribution for this iteration
+        probs = F.softmax(logits,dim=-1)
+        neg_probs = torch.clamp(1-probs, min=1e-8)
+        log_neg_probs = torch.log(neg_probs)
+
+        N,s,v = logits.shape
+
+        with torch.no_grad():
+            #greedy output
+            gen_ids = self.model.generate(src_ids, 
+                                     max_length=min(s,args.max_target_length),
+                                     early_stopping=False, 
+                                     num_return_sequences=1, 
+                                     decoder_start_token_id=self.model.config.pad_token_id) # (N, s)
+
+            #create mask
+            mask = self.ngram_repeat_mask(src_ids, gen_ids, decoder_input_ids, n) # (N, s)
+
+            #mask padded input positions
+            mask_pad = decoder_input_ids.eq(1).eq(0).float() # (N,s)
+ 
+            #extend vector gen_ids to have same sequence length as decoder_input_ids
+            if gen_ids.shape[1] < s:
+                extra = torch.ones((N, s-gen_ids.shape[1]), dtype=torch.long).cuda()
+                gen_ids = torch.cat((gen_ids, extra), dim=1) # (N, s)
+
+            gen_ids_mask = F.one_hot(gen_ids, num_classes=v) # (N,s,v)
+
+        log_neg_probs = torch.sum(log_neg_probs * gen_ids_mask, dim=-1) # (N, s)
+        loss = torch.sum(log_neg_probs * mask * mask_pad)
+        return -loss
 
 
     def forward(self, input_ids, **kwargs):
@@ -201,17 +370,54 @@ class SummarizationModule(BaseTransformer):
             loss, nll_loss = label_smoothed_nll_loss(
                 lprobs, tgt_ids, self.hparams.label_smoothing, ignore_index=pad_token_id
             )
- 
-        if self.unlikelihood_training:
-            ul_loss = self.unlikelihood_loss(decoder_input_ids, lm_logits, self.weight_vector, self.unlikelihood_selective_penalty)
+
+        batch_size = src_ids.shape[0]
+
+        print("********************")
+        print(f"batch size: {batch_size}")
+        print("********************")
+
+        loss_log = {'ce': loss.item()}
+
+        if self.unlikelihood_training_tokens:
+            ul_token_loss = self.unlikelihood_loss_token(decoder_input_ids, tgt_ids, lm_logits)
+            ul_token_loss_weighted = ul_token_loss * self.unlikelihood_tokens_alpha
 
             print("*******************")
             print(f"loss: {loss}")
-            print(f"UL loss: {self.unlikelihood_alpha * ul_loss}")
+            print(f"UL token loss: {ul_token_loss_weighted}")
             print("*******************")
 
-            loss += self.unlikelihood_alpha * ul_loss
+            loss_log['ul_token'] = ul_token_loss_weighted.item()/batch_size
+            loss += ul_token_loss_weighted
 
+
+        if self.unlikelihood_training_copy:
+            ul_copy_loss = self.unlikelihood_loss_copying(src_ids, decoder_input_ids, lm_logits, self.unlikelihood_copy_n)
+            ul_copy_loss_weighted = self.unlikelihood_copy_alpha * ul_copy_loss
+
+            print("*******************")
+            print(f"loss: {loss}")
+            print(f"UL copy loss: {ul_copy_loss_weighted}")
+            print("*******************")
+ 
+            loss_log['ul_copy'] = ul_copy_loss_weighted.item()/batch_size
+            loss += ul_copy_loss_weighted
+
+ 
+        if self.unlikelihood_training:
+            ul_loss = self.unlikelihood_loss(decoder_input_ids, lm_logits, self.weight_vector, self.unlikelihood_selective_penalty)
+            ul_loss_weighted = ul_loss * self.unlikelihood_alpha
+
+            print("*******************")
+            print(f"loss: {loss}")
+            print(f"UL loss: {ul_loss_weighted}")
+            print("*******************")
+
+            loss_log['ul_logr'] = ul_loss_weighted.item()/batch_size
+            loss += ul_loss_weighted
+
+        self.losses.append(loss_log)
         return (loss,)
 
     @property
@@ -391,13 +597,23 @@ class SummarizationModule(BaseTransformer):
             help="-1 means never early stop. early_stopping_patience is measured in validation checks, not epochs. So val_check_interval will effect it.",
         )
 
+        ####################################
+        ##        Decoding Strategy       ##
+        ####################################
 
-        ###################################
-        ##  Unlikelhood Loss Parameters  ##
-        ###################################
+        parser.add_argument('--decode_method', choices=['greedy', 'beam', 'nucleus'])
+        parser.add_argument("--decode_num_beams", default=5, type=int, required=False, help="")
+        parser.add_argument("--decode_p", default=0.9, type=float, required=False, help="")
+        parser.add_argument("--decode_ngram_copy_penalty", default=None, type=int, required=False)
+        parser.add_argument("--decode_ngram_copy_weight", default=None, type=float, required=False)
+        
+
+        ####################################
+        ##  Unlikelihood Loss Parameters  ##
+        ####################################
 
         parser.add_argument("--unlikelihood_training", action="store_true", help="whether to use unlikelihood training")
-        parser.add_argument("--unlikelihood_weights_file", default="data/logr_weights/bart_freq_normalized_ids.txt", type=str, required=False, 
+        parser.add_argument("--unlikelihood_weights_file", default="cochrane", type=str, required=False, 
                             help="The file containing logistic regression weights for use in unlikelihood training")
 
         parser.add_argument("--unlikelihood_exclude_tokens", default="", type=str, required=False, help="Comma-separated numbers")
@@ -407,13 +623,22 @@ class SummarizationModule(BaseTransformer):
         parser.add_argument("--unlikelihood_selective_penalty", action="store_true", help="whether to use unlikelihood loss only if argmax is the penalty token")
         parser.add_argument("--unlikelihood_alpha", default=10.0, type=float, required=False, help="")
 
-        ################################
-        ###   Ratio Loss Parameters  ###
-        ################################
 
-        parser.add_argument("--ratio_training", action="store_true", help="whether to emply ratio training")
-        parser.add_argument("--ratio_alpha", default=10.0, type=float, required=False, help="scale factor in loss")
-        parser.add_argument("--ratio_mask_fraction", default=0.15, type=float, required=False, help="ratio of tokens that are masked when computing BERT probabilities")
+        ##########################################
+        ##  Unlikelihood Loss Token Parameters  ##
+        ##########################################
+
+        parser.add_argument("--unlikelihood_training_tokens", action="store_true", help="whether to use unlikelihood training at token level")
+        parser.add_argument("--unlikelihood_tokens_alpha", default=1.0, type=float, required=False, help="")
+
+
+        ##########################################
+        ##  Unlikelihood Loss Copy Parameters   ##
+        ##########################################
+
+        parser.add_argument("--unlikelihood_training_copy", action="store_true", help="whether to use unlikelihood training to penalize copied text")
+        parser.add_argument("--unlikelihood_copy_alpha", default=1.0, type=float, required=False, help="")
+        parser.add_argument("--unlikelihood_copy_n", default=3, type=int, required=False, help="")
 
         return parser
 
@@ -432,6 +657,28 @@ class TranslationModule(SummarizationModule):
     def calc_generative_metrics(self, preds, target) -> dict:
         return calculate_bleu(preds, target)
 
+def create_weight_vector(fname, model):
+
+    #prepare weights vectors
+    weights = []
+    with open(fname) as f:
+        for line in filter(lambda l: len(l) > 0, f.readlines()):
+            index, weight = line.strip().split()
+
+            if int(index) not in model.unlikelihood_exclude_tokens:
+                weights.append((int(index), float(weight)))
+
+    num_weights = model.unlikelihood_num_weights
+    weights = [w for w in weights if w[1] < 0]
+
+    if num_weights > -1:
+        weights = weights[:num_weights]
+
+    #split ids and weights
+    ids = [x[0] for x in weights]
+    weights = torch.tensor([abs(x[1]) for x in weights])
+    return ids,weights
+
 
 def set_ul_params(model, hparams):
 
@@ -448,67 +695,90 @@ def set_ul_params(model, hparams):
     model.unlikelihood_selective_penalty = hparams.unlikelihood_selective_penalty
     model.unlikelihood_alpha = hparams.unlikelihood_alpha
     model.unlikelihood_exclude_tokens = set([int(i) for i in hparams.unlikelihood_exclude_tokens.split(',')])
-
-    #prepare weights vectors
-    weights = []
-    with open(model.unlikelihood_weights_file) as f:
-        for line in filter(lambda l: len(l) > 0, f.readlines()):
-            index, weight = line.strip().split()
-
-            if int(index) not in model.unlikelihood_exclude_tokens:
-                weights.append((int(index), float(weight)))
-
-    num_weights = model.unlikelihood_num_weights
-    weights = [w for w in weights if w[1] < 0]
-
-    if num_weights > -1:
-        weights = weights[:num_weights]
-
-    #split ids and weights
-    ids = [x[0] for x in weights]
-    weights = torch.tensor([abs(x[1]) for x in weights])
-
-    if model.unlikelihood_softmax:
-        weights = F.softmax(weights/model.unlikelihood_temperature, dim=-1)
-    else:
-        #normalize alpha if not applying softmax
-        model.unlikelihood_alpha /= torch.sum(weights).item()
-
-    #now create weight masks
     model.vocab_size = model.model.config.vocab_size
-    weight_vector = torch.zeros(model.vocab_size).float()
 
-    for i in range(len(ids)):
-        weight_vector[ids[i]] = weights[i]
+    weights = None
+    mask = None
+    if model.unlikelihood_weights_file == 'cochrane':
+        ids, weights = create_weight_vector("data/logr_weights/bart_freq_normalized_ids.txt", model)
+    elif model.unlikelihood_weights_file == 'newsela':
+        ids, weights = create_weight_vector("data/logr_weights/bart_freq_newsela_ids.txt", model)
+    elif model.unlikelihood_weights_file == 'both':
+        ids1, weights1 = create_weight_vector("data/logr_weights/bart_freq_normalized_ids.txt", model)
+        ids2, weights2 = create_weight_vector("data/logr_weights/bart_freq_newsela_ids.txt", model)
+    else:
+        raise Exception()
 
-    model.weight_vector = weight_vector.to('cuda')
+    if model.unlikelihood_weights_file != 'both':
+
+        if model.unlikelihood_softmax:
+            weights = F.softmax(weights/model.unlikelihood_temperature, dim=-1)
+        else:
+            #normalize alpha if not applying softmax
+            model.unlikelihood_alpha /= torch.sum(weights).item()
+
+        weight_vector = torch.zeros(model.vocab_size).float()
+        for i in range(len(ids)):
+            weight_vector[ids[i]] = weights[i]
+
+        model.weight_vector = weight_vector.to('cuda')
+        model.binary_weight_mask = (weight_vector != 0).int()
+
+    else:
+        ids = sorted(list(set(ids1 + ids2)))
+        id_map = {ID: i for i,ID in enumerate(ids)}
+        weights = torch.zeros(len(ids))
+
+        for i,ID in enumerate(ids1):
+           weights[id_map[ID]] += weights1[i]
+
+        for i,ID in enumerate(ids2):
+           weights[id_map[ID]] += weights2[i]
+
+        if model.unlikelihood_softmax:
+            weights = F.softmax(weights/model.unlikelihood_temperature, dim=-1)
+        else:
+            #normalize alpha if not applying softmax
+            model.unlikelihood_alpha /= torch.sum(weights).item()
+
+        #now create weight masks
+        weight_vector = torch.zeros(model.vocab_size).float()
+        for i in range(len(ids)):
+            weight_vector[ids[i]] = weights[i]
+
+        model.weight_vector = weight_vector.to('cuda')
+        model.binary_weight_mask = (weight_vector != 0).int()
 
 
-def set_ratio_params(model, hparams):
+def set_ul_token_params(model, hparams):
+    model.unlikelihood_training_tokens = hparams.unlikelihood_training_tokens
+    model.unlikelihood_tokens_alpha = hparams.unlikelihood_tokens_alpha
 
-    model.ratio_training = hparams.ratio_training
-
-    if not model.ratio_training:
-        return
-
-    model.ratio_alpha = hparams.ratio_alpha
-    model.ratio_mask_fraction = hparams.ratio_mask_fraction
-    model.bert_model = 
-
+def set_ul_copy_params(model, hparams):
+    model.unlikelihood_training_copy = hparams.unlikelihood_training_copy
+    model.unlikelihood_copy_alpha = hparams.unlikelihood_copy_alpha
+    model.unlikelihood_copy_n = hparams.unlikelihood_copy_n
 
 def main(args, model=None) -> SummarizationModule:
 
     Path(args.output_dir).mkdir(exist_ok=True)
     if len(os.listdir(args.output_dir)) > 3 and args.do_train:
         raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
+
     if model is None:
         if "summarization" in args.task:
             model: SummarizationModule = SummarizationModule(args)
         else:
             model: SummarizationModule = TranslationModule(args)
 
-    #add unlikelihood parameters
+    #add unlikelihood parameters - with logr weights
     set_ul_params(model, args)
+
+    #add unlikelihood parameters - token-level
+    set_ul_token_params(model, args) 
+
+    #add unlikelihood parameters - copying
+    set_ul_copy_params(model, args) 
 
     dataset = Path(args.data_dir).name
     if (
@@ -536,9 +806,12 @@ def main(args, model=None) -> SummarizationModule:
 
 
     trainer = None
+
     if args.do_train:
+
         lower_is_better = args.val_metric == "loss"
         save_top_k = args.max_epochs
+
         trainer: pl.Trainer = generic_train(
             model,
             args,
@@ -549,22 +822,16 @@ def main(args, model=None) -> SummarizationModule:
             early_stopping_callback=es_callback,
             logger=logger,
         )
-        pickle_save(model.hparams, model.output_dir / "hparams.pkl") 
+        pickle_save(model.hparams, model.output_dir / "hparams.pkl")
 
-    if args.do_predict:
-        model.hparams.test_checkpoint = ""
-        checkpoints = list(sorted(glob.glob(os.path.join(args.output_dir, "*.ckpt"), recursive=True)))
-        if checkpoints:
-            model.hparams.test_checkpoint = checkpoints[-1]
-            trainer.resume_from_checkpoint = checkpoints[-1]
-        trainer.logger.log_hyperparams(model.hparams)
+        #now write loss logs into the same directory
+        with open(os.path.join(args.output_dir, 'loss_logs.json'), 'w') as f:
+            f.write(json.dumps(model.losses, indent=2))
 
-        # test() without a model tests using the best checkpoint automatically
-        trainer.test()
 
     if args.do_generate:
 
-        print('generating pls...')
+        model = model.model
 
         if args.generate_epoch > -1:
             model = BartForConditionalGeneration.from_pretrained(join(args.output_dir, f'best_tfmr-{args.generate_epoch}'))
@@ -600,45 +867,71 @@ def main(args, model=None) -> SummarizationModule:
         batch = tokenizer(abstracts, padding='max_length', max_length=args.max_source_length, truncation=True, return_tensors='pt')
         input_ids = batch['input_ids']
 
-        for i,d,a,p in zip(range(len(dois)), dois, abstracts, pls):
-            try:
-                ids = input_ids[i]
-                #gen_ids = model.generate(ids.unsqueeze(0), 
-                #                         num_beams=4, 
-                #                         max_length=args.max_target_length, 
-                #                         early_stopping=False, 
-                #                         num_return_sequences=1, 
-                #                         decoder_start_token_id=model.config.pad_token_id)
+        fname_prefix = f'gen_{args.decode_method}_'
+        if args.decode_ngram_copy_penalty is not None and args.decode_ngram_copy_weight is not None:
+            fname_prefix += f'copy-{args.decode_ngram_copy_penalty}-{args.decode_ngram_copy_weight}_'
+        fname_prefix += f'{args.generate_input_prefix}_{args.generate_epoch}_{args.generate_start_index}-{args.generate_end_index}'
 
-                gen_ids = model.generate(ids.unsqueeze(0), 
+        fname_text = fname_prefix + '_text_only.txt'
+
+        logs_list = []
+        for i,d,a,p in zip(range(len(dois)), dois, abstracts, pls):
+            ids = input_ids[i]
+
+            logs = None
+            if args.decode_method=='greedy':
+                gen_ids,logs = model.generate(ids.unsqueeze(0), 
+                                         do_sample=False,
+                                         ngram_copy_penalty=args.decode_ngram_copy_penalty,
+                                         ngram_copy_weight=args.decode_ngram_copy_weight,
                                          max_length=args.max_target_length, 
-                                         top_p=0.9, 
+                                         early_stopping=False, 
+                                         num_return_sequences=1, 
+                                         decoder_start_token_id=model.config.pad_token_id)
+            elif args.decode_method=='beam':
+                gen_ids,logs = model.generate(ids.unsqueeze(0), 
+                                         ngram_copy_penalty=args.decode_ngram_copy_penalty,
+                                         ngram_copy_weight=args.decode_ngram_copy_weight,
+                                         num_beams=args.decode_num_beams,
+                                         max_length=args.max_target_length, 
+                                         early_stopping=False, 
+                                         num_return_sequences=1, 
+                                         decoder_start_token_id=model.config.pad_token_id)
+            else:
+                gen_ids,logs = model.generate(ids.unsqueeze(0),
+                                         do_sample=True,
+                                         ngram_copy_penalty=args.decode_ngram_copy_penalty,
+                                         ngram_copy_weight=args.decode_ngram_copy_weight,
+                                         top_p=args.decode_p,
+                                         max_length=args.max_target_length, 
                                          early_stopping=False, 
                                          num_return_sequences=1, 
                                          decoder_start_token_id=model.config.pad_token_id)
 
-                gen_text = tokenizer.decode(gen_ids.squeeze(0), skip_special_tokens=True, clean_up_tokenization_spaces=False)
-                
-                dois_final.append(dois[i])
-                abstracts_final.append(abstracts[i])
-                pls_final.append(pls[i])
-                gen_final.append(gen_text)
+            gen_text = tokenizer.decode(gen_ids.squeeze(0), skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            
+            dois_final.append(dois[i])
+            abstracts_final.append(abstracts[i])
+            pls_final.append(pls[i])
+            gen_final.append(gen_text)
 
-                fname_text = f'gen_nucleus_{args.generate_input_prefix}_{args.generate_epoch}_{args.generate_start_index}-{args.generate_end_index}_text_only.txt'
+            if logs is not None:
+                logs_list.append(logs)
 
-                with open(join(args.output_dir, fname_text), 'a+') as f:
-                    f.write(gen_text + '\n----------------------------------------\n')
-                    f.flush()
-                
-                print(gen_text + '\n----------------------------------------\n')
-            except:
-                print(f'EXCEPTION: {i}')
-                print(d)
+            with open(join(args.output_dir, fname_text), 'a+') as f:
+                f.write(gen_text + '\n----------------------------------------\n')
+                f.flush()
+            
+            print(gen_text + '\n----------------------------------------\n')
 
         output = [{'doi': d, 'abstract': a, 'pls': p, 'gen': g} for d,a,p,g in zip(dois_final, abstracts_final, pls_final, gen_final)]
- 
-        fname_json = f'gen_nucleus_{args.generate_input_prefix}_{args.generate_epoch}_{args.generate_start_index}-{args.generate_end_index}.json'
+
+        fname_json = fname_prefix + '.json'
         open(join(args.output_dir, fname_json), 'w').write(json.dumps(output, indent=2))
+
+        if len(logs_list) > 0:
+            fname_logs = fname_prefix + '_log.json'
+            open(join(args.output_dir, fname_logs), 'w').write(json.dumps(logs_list, indent=2))
 
     return model
 
