@@ -23,10 +23,12 @@ from transformers import (
 )
 from transformers.optimization import (
     Adafactor,
+    get_constant_schedule,
     get_cosine_schedule_with_warmup,
     get_cosine_with_hard_restarts_schedule_with_warmup,
     get_linear_schedule_with_warmup,
     get_polynomial_decay_schedule_with_warmup,
+    get_constant_schedule_with_warmup
 )
 
 
@@ -47,12 +49,12 @@ MODEL_MODES = {
 
 # update this and the import above to support new schedulers from transformers.optimization
 arg_to_scheduler = {
+    "constant": get_constant_schedule,
     "linear": get_linear_schedule_with_warmup,
     "cosine": get_cosine_schedule_with_warmup,
     "cosine_w_restarts": get_cosine_with_hard_restarts_schedule_with_warmup,
     "polynomial": get_polynomial_decay_schedule_with_warmup,
-    # '': get_constant_schedule,             # not supported for now
-    # '': get_constant_schedule_with_warmup, # not supported for now
+    "constant_w_warmup": get_constant_schedule_with_warmup
 }
 arg_to_scheduler_choices = sorted(arg_to_scheduler.keys())
 arg_to_scheduler_metavar = "{" + ", ".join(arg_to_scheduler_choices) + "}"
@@ -118,9 +120,27 @@ class BaseTransformer(pl.LightningModule):
 
     def get_lr_scheduler(self):
         get_schedule_func = arg_to_scheduler[self.hparams.lr_scheduler]
-        scheduler = get_schedule_func(
-            self.opt, num_warmup_steps=self.hparams.warmup_steps, num_training_steps=self.total_steps()
-        )
+        total_steps = self.total_steps()
+        warmup_steps = int(total_steps * float(self.hparams.warmup_steps)) if '.' in self.hparams.warmup_steps else int(self.hparams.warmup_steps)
+
+        print("********************************")
+        print(f"total steps: {total_steps}, warmup steps: {warmup_steps}")
+        print("********************************")
+
+        #TODO: maybe make this a bit more elegant
+        if self.hparams.lr_scheduler == 'constant':
+            scheduler = get_schedule_func(
+                self.opt
+            )
+        elif self.hparams.lr_scheduler == 'constant_w_warmup':
+            scheduler = get_schedule_func(
+                self.opt, num_warmup_steps=warmup_steps
+            )
+        else:
+            scheduler = get_schedule_func(
+                self.opt, num_warmup_steps=warmup_steps, num_training_steps=total_steps
+            )
+
         scheduler = {"scheduler": scheduler, "interval": "step", "frequency": 1}
         return scheduler
 
@@ -196,7 +216,8 @@ class BaseTransformer(pl.LightningModule):
 
     @pl.utilities.rank_zero_only
     def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        save_path = self.output_dir.joinpath("best_tfmr")
+
+        save_path = self.output_dir.joinpath(f"best_tfmr-{checkpoint['epoch']}")
         self.model.config.save_step = self.step_count
         self.model.save_pretrained(save_path)
         self.tokenizer.save_pretrained(save_path)
@@ -256,7 +277,7 @@ class BaseTransformer(pl.LightningModule):
         )
         parser.add_argument("--weight_decay", default=0.0, type=float, help="Weight decay if we apply some.")
         parser.add_argument("--adam_epsilon", default=1e-8, type=float, help="Epsilon for Adam optimizer.")
-        parser.add_argument("--warmup_steps", default=0, type=int, help="Linear warmup over warmup_steps.")
+        parser.add_argument("--warmup_steps", default="0", type=str, help="Linear warmup over warmup_steps.")
         parser.add_argument("--num_workers", default=4, type=int, help="kwarg passed to DataLoader")
         parser.add_argument("--num_train_epochs", dest="max_epochs", default=3, type=int)
         parser.add_argument("--train_batch_size", default=32, type=int)
@@ -314,8 +335,16 @@ def add_generic_args(parser, root_dir) -> None:
     )
     parser.add_argument("--n_tpu_cores", dest="tpu_cores", type=int)
     parser.add_argument("--max_grad_norm", dest="gradient_clip_val", default=1.0, type=float, help="Max gradient norm")
+    parser.add_argument("--do_pretrain", action="store_true", help="Whether to run pre-training.")
+    parser.add_argument("--use_pretrained", action="store_true", help="Whether to use pre-trained model for training.")
     parser.add_argument("--do_train", action="store_true", help="Whether to run training.")
     parser.add_argument("--do_predict", action="store_true", help="Whether to run predictions on the test set.")
+    parser.add_argument("--do_generate", action="store_true", help="Whether to generate text")
+    parser.add_argument("--generate_input_prefix", default="test", type=str, required=False)
+    parser.add_argument("--generate_epoch", default=1, type=int, required=False)
+    parser.add_argument("--generate_batch_size", default=1, type=int, required=False)
+    parser.add_argument("--generate_start_index", default='none', type=str, required=False)
+    parser.add_argument("--generate_end_index", default='none', type=str, required=False)
     parser.add_argument(
         "--gradient_accumulation_steps",
         dest="accumulate_grad_batches",
@@ -330,6 +359,13 @@ def add_generic_args(parser, root_dir) -> None:
         type=str,
         required=True,
         help="The input data dir. Should contain the training files for the CoNLL-2003 NER task.",
+    )
+    parser.add_argument(
+        "--pretraining_data_dir",
+        default="",
+        type=str,
+        required=False,
+        help="The input data dir for pretraining.",
     )
 
 

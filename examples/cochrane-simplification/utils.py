@@ -122,7 +122,8 @@ class AbstractSeq2SeqDataset(Dataset):
         self.tgt_file = Path(data_dir).joinpath(type_path + ".target")
         self.len_file = Path(data_dir).joinpath(type_path + ".len")
         if os.path.exists(self.len_file):
-            self.src_lens = pickle_load(self.len_file)
+            #self.src_lens = pickle_load(self.len_file)
+            self.src_lens = [int(l) for l in open(self.len_file).readlines()]
             self.used_char_len = False
         else:
             self.src_lens = self.get_char_lens(self.src_file)
@@ -159,18 +160,20 @@ class AbstractSeq2SeqDataset(Dataset):
 
     def make_dynamic_sampler(self, max_tokens_per_batch=1024, **kwargs):
         assert FAIRSEQ_AVAILABLE, "Dynamic batch size requires `pip install fairseq`"
-        assert not self.used_char_len, "You must call  python make_len_file.py before calling make_dynamic_sampler"
+        #assert not self.used_char_len, "You must call  python make_len_file.py before calling make_dynamic_sampler"
         sorted_indices = list(self.make_sortish_sampler(1024, shuffle=False))
 
         def num_tokens_in_example(i):
-            return min(self.src_lens[i], self.max_target_length)
+            #return min(self.src_lens[i], self.max_target_length)
+            return self.src_lens[i]
 
         # call fairseq cython function
         batch_sampler: List[List[int]] = batch_by_size(
             sorted_indices,
             num_tokens_fn=num_tokens_in_example,
             max_tokens=max_tokens_per_batch,
-            required_batch_size_multiple=64,
+            #CHANGED required_batch_size_multiple=64,
+            required_batch_size_multiple=1,
         )
         shuffled_batches = [batch_sampler[i] for i in np.random.permutation(range(len(batch_sampler)))]
         # move the largest batch to the front to OOM quickly (uses an approximation for padding)

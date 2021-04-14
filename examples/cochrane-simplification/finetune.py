@@ -10,6 +10,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple
+from copy import deepcopy
 
 import gc
 import json
@@ -17,6 +18,7 @@ import numpy as np
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from torch.optim import SGD
 from torch.utils.data import DataLoader
 import time
 
@@ -311,7 +313,7 @@ class SummarizationModule(BaseTransformer):
 
         with torch.no_grad():
             #greedy output
-            gen_ids = self.model.generate(src_ids, 
+            gen_ids,logs = self.model.generate(src_ids, 
                                      max_length=min(s,args.max_target_length),
                                      early_stopping=False, 
                                      num_return_sequences=1, 
@@ -372,11 +374,6 @@ class SummarizationModule(BaseTransformer):
             )
 
         batch_size = src_ids.shape[0]
-
-        print("********************")
-        print(f"batch size: {batch_size}")
-        print("********************")
-
         loss_log = {'ce': loss.item()}
 
         if self.unlikelihood_training_tokens:
@@ -470,7 +467,7 @@ class SummarizationModule(BaseTransformer):
         t0 = time.time()
 
         # parser.add_argument('--eval_max_gen_length', type=int, default=None, help='never generate more than n tokens')
-        generated_ids = self.model.generate(
+        generated_ids,logs = self.model.generate(
             batch["input_ids"],
             attention_mask=batch["attention_mask"],
             use_cache=True,
@@ -604,9 +601,11 @@ class SummarizationModule(BaseTransformer):
         parser.add_argument('--decode_method', choices=['greedy', 'beam', 'nucleus'])
         parser.add_argument("--decode_num_beams", default=5, type=int, required=False, help="")
         parser.add_argument("--decode_p", default=0.9, type=float, required=False, help="")
+        parser.add_argument("--decode_state_change_copy", action="store_true", required=False)
+        parser.add_argument("--decode_state_change_copy_alpha", default=0.1, type=float, required=False)
+        parser.add_argument("--decode_state_change_copy_n", default=3, type=int, required=False)
         parser.add_argument("--decode_ngram_copy_penalty", default=None, type=int, required=False)
         parser.add_argument("--decode_ngram_copy_weight", default=None, type=float, required=False)
-        
 
         ####################################
         ##  Unlikelihood Loss Parameters  ##
@@ -623,14 +622,12 @@ class SummarizationModule(BaseTransformer):
         parser.add_argument("--unlikelihood_selective_penalty", action="store_true", help="whether to use unlikelihood loss only if argmax is the penalty token")
         parser.add_argument("--unlikelihood_alpha", default=10.0, type=float, required=False, help="")
 
-
         ##########################################
         ##  Unlikelihood Loss Token Parameters  ##
         ##########################################
 
         parser.add_argument("--unlikelihood_training_tokens", action="store_true", help="whether to use unlikelihood training at token level")
         parser.add_argument("--unlikelihood_tokens_alpha", default=1.0, type=float, required=False, help="")
-
 
         ##########################################
         ##  Unlikelihood Loss Copy Parameters   ##
@@ -642,20 +639,87 @@ class SummarizationModule(BaseTransformer):
 
         return parser
 
+def generate_decode_copy(
+    model,
+    args,
+    input_ids
+):
+    assert input_ids.shape[0]==1, "Ngram repetition penalty only supported for batch size of 1 (for now)"
 
-class TranslationModule(SummarizationModule):
-    mode = "translation"
-    loss_names = ["loss"]
-    metric_names = ["bleu"]
-    default_val_metric = "bleu"
+    alpha = args.decode_state_change_copy_alpha
+    n = args.decode_state_change_copy_n
 
-    def __init__(self, hparams, **kwargs):
-        super().__init__(hparams, **kwargs)
-        self.dataset_kwargs["src_lang"] = hparams.src_lang
-        self.dataset_kwargs["tgt_lang"] = hparams.tgt_lang
+    temp = model
+    model = SummarizationModule(args)
+    model.model = temp.to('cuda')
+    model.model.train()
+    input_ids = input_ids.to('cuda')
 
-    def calc_generative_metrics(self, preds, target) -> dict:
-        return calculate_bleu(preds, target)
+    # initialize optimizer
+    #optimizer = SGD(model.model.parameters(), lr=1.0)
+    #optimizer.zero_grad()
+
+    # first generate output normally
+    tgt_ids,logs = model.model.generate(input_ids, 
+                           do_sample=False,
+                           num_beams=1,
+                           max_length=1024,
+                           early_stopping=False, 
+                           num_return_sequences=1, 
+                           decoder_start_token_id=model.model.config.pad_token_id)
+
+    # treat generated text as decoder target
+    pad_token_id = model.model.config.pad_token_id
+    decoder_input_ids = shift_tokens_right(tgt_ids, pad_token_id)
+    outputs = model(input_ids, decoder_input_ids=decoder_input_ids, use_cache=False)
+    lm_logits = outputs[0]
+
+    input_ids = input_ids.tolist()
+    decoder_input_ids = decoder_input_ids.tolist()
+    tgt_ids = tgt_ids.tolist()
+
+    open('input_ids.txt', 'w').write(json.dumps(input_ids))
+    open('decoder_input_ids.txt', 'w').write(json.dumps(decoder_input_ids))
+    open('tgt_ids.txt', 'w').write(json.dumps(tgt_ids))
+    return None
+
+    # apply repetition penalty
+    loss = model.unlikelihood_loss_copying(input_ids, decoder_input_ids, lm_logits, n) * alpha
+    #loss.backward()
+    #optimizer.step()
+
+    # now re-generate output
+    if args.decode_method=='greedy':
+        gen_ids,logs = model.model.generate(input_ids, 
+                                 do_sample=False,
+                                 ngram_copy_penalty=args.decode_ngram_copy_penalty,
+                                 ngram_copy_weight=args.decode_ngram_copy_weight,
+                                 max_length=args.max_target_length, 
+                                 early_stopping=False, 
+                                 num_return_sequences=1, 
+                                 decoder_start_token_id=model.model.config.pad_token_id)
+    elif args.decode_method=='beam':
+        gen_ids,logs = model.model.generate(input_ids, 
+                                 ngram_copy_penalty=args.decode_ngram_copy_penalty,
+                                 ngram_copy_weight=args.decode_ngram_copy_weight,
+                                 num_beams=args.decode_num_beams,
+                                 max_length=args.max_target_length, 
+                                 early_stopping=False, 
+                                 num_return_sequences=1, 
+                                 decoder_start_token_id=model.model.config.pad_token_id)
+    else:
+        gen_ids,logs = model.model.generate(input_ids,
+                                 do_sample=True,
+                                 ngram_copy_penalty=args.decode_ngram_copy_penalty,
+                                 ngram_copy_weight=args.decode_ngram_copy_weight,
+                                 top_p=args.decode_p,
+                                 max_length=args.max_target_length, 
+                                 early_stopping=False, 
+                                 num_return_sequences=1, 
+                                 decoder_start_token_id=model.model.config.pad_token_id)
+
+    return gen_ids,logs
+
 
 def create_weight_vector(fname, model):
 
@@ -765,11 +829,7 @@ def main(args, model=None) -> SummarizationModule:
     if len(os.listdir(args.output_dir)) > 3 and args.do_train:
         raise ValueError("Output directory ({}) already exists and is not empty.".format(args.output_dir))
 
-    if model is None:
-        if "summarization" in args.task:
-            model: SummarizationModule = SummarizationModule(args)
-        else:
-            model: SummarizationModule = TranslationModule(args)
+    model = SummarizationModule(args)
 
     #add unlikelihood parameters - with logr weights
     set_ul_params(model, args)
@@ -831,8 +891,6 @@ def main(args, model=None) -> SummarizationModule:
 
     if args.do_generate:
 
-        model = model.model
-
         if args.generate_epoch > -1:
             model = BartForConditionalGeneration.from_pretrained(join(args.output_dir, f'best_tfmr-{args.generate_epoch}'))
         else:
@@ -868,7 +926,9 @@ def main(args, model=None) -> SummarizationModule:
         input_ids = batch['input_ids']
 
         fname_prefix = f'gen_{args.decode_method}_'
-        if args.decode_ngram_copy_penalty is not None and args.decode_ngram_copy_weight is not None:
+        if args.decode_state_change_copy:
+            fname_prefix += f'decode-state-change-copy-{args.decode_state_change_copy_alpha}-{args.decode_state_change_copy_n}_'
+        elif args.decode_ngram_copy_penalty is not None and args.decode_ngram_copy_weight is not None:
             fname_prefix += f'copy-{args.decode_ngram_copy_penalty}-{args.decode_ngram_copy_weight}_'
         fname_prefix += f'{args.generate_input_prefix}_{args.generate_epoch}_{args.generate_start_index}-{args.generate_end_index}'
 
@@ -877,9 +937,11 @@ def main(args, model=None) -> SummarizationModule:
         logs_list = []
         for i,d,a,p in zip(range(len(dois)), dois, abstracts, pls):
             ids = input_ids[i]
-
             logs = None
-            if args.decode_method=='greedy':
+
+            if args.decode_state_change_copy:
+                gen_ids,logs = generate_decode_copy(model, args, ids.unsqueeze(0))
+            elif args.decode_method=='greedy':
                 gen_ids,logs = model.generate(ids.unsqueeze(0), 
                                          do_sample=False,
                                          ngram_copy_penalty=args.decode_ngram_copy_penalty,
@@ -897,7 +959,7 @@ def main(args, model=None) -> SummarizationModule:
                                          early_stopping=False, 
                                          num_return_sequences=1, 
                                          decoder_start_token_id=model.config.pad_token_id)
-            else:
+            elif args.decode_method=='nucleus':
                 gen_ids,logs = model.generate(ids.unsqueeze(0),
                                          do_sample=True,
                                          ngram_copy_penalty=args.decode_ngram_copy_penalty,
@@ -941,7 +1003,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser = pl.Trainer.add_argparse_args(parser)
     parser = SummarizationModule.add_model_specific_args(parser, os.getcwd())
-
     args = parser.parse_args()
-
     main(args)
